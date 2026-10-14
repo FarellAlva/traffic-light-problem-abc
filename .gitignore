@@ -1,1 +1,6 @@
 .codegraph
+*.docx
+~$*
+__pycache__/
+*.pyc
+Laporan_Optimasi_Traffic_Light_ABC_Farell.docx
