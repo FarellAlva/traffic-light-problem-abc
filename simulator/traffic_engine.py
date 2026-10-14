@@ -27,45 +27,44 @@ def _lerp_path(path, t):
 
 
 class TrafficLight:
-    """State machine: RED → GREEN → YELLOW → RED"""
-    STATES = ["RED", "GREEN", "YELLOW"]
-
+    """
+    Light display model for a single direction.
+    State, durations, and remaining countdown are managed centrally by Intersection
+    to strictly guarantee that exactly one approach has green/yellow at any time.
+    """
     def __init__(self, direction: str, offset: float = 0.0):
         self.direction = direction
-        self.red_duration    = DEFAULT_RED_DURATION[direction]
-        self.green_duration  = DEFAULT_GREEN_DURATION[direction]
+        self.state = "RED"  # "RED", "GREEN", "YELLOW"
+        self._time_remaining = 0.0
+        self.green_duration = DEFAULT_GREEN_DURATION.get(direction, 25.0)
+        self.red_duration = DEFAULT_RED_DURATION.get(direction, 84.0)
         self.yellow_duration = DEFAULT_YELLOW_DURATION
-
-        self._state_idx = 0   # start RED
-        self._timer = offset  # pre-offset so lanes stagger
-
-    @property
-    def state(self) -> str:
-        return self.STATES[self._state_idx]
 
     @property
     def is_green(self) -> bool:
-        return self._state_idx == 1
+        return self.state == "GREEN"
 
     @property
     def is_yellow(self) -> bool:
-        return self._state_idx == 2
+        return self.state == "YELLOW"
 
     @property
     def is_red(self) -> bool:
-        return self._state_idx == 0
+        return self.state == "RED"
 
     def current_duration(self) -> float:
-        return [self.red_duration, self.green_duration, self.yellow_duration][self._state_idx]
+        if self.state == "GREEN":
+            return self.green_duration
+        elif self.state == "YELLOW":
+            return self.yellow_duration
+        return self.red_duration
 
     def time_remaining(self) -> float:
-        return max(0.0, self.current_duration() - self._timer)
+        return max(0.0, self._time_remaining)
 
     def update(self, dt: float):
-        self._timer += dt
-        while self._timer >= self.current_duration():
-            self._timer -= self.current_duration()
-            self._state_idx = (self._state_idx + 1) % 3
+        # Controlled centrally by Intersection master phase sequencer
+        pass
 
 
 def _weighted_choice(weights: dict) -> str:
@@ -185,6 +184,9 @@ class Vehicle:
         return self.t >= 1.0
 
 
+PHASE_ORDER = ["NORTH", "EAST", "SOUTH", "WEST"]
+
+
 class Lane:
     """Manages all vehicles for one direction (incoming + outgoing)."""
 
@@ -194,21 +196,27 @@ class Lane:
         self.incoming: list[Vehicle] = []
         self.outgoing: list[Vehicle] = []
 
-        self._spawn_timer_in  = {i: random.uniform(0, SPAWN_INTERVAL_BASE * 0.8)
+        self._spawn_timer_in  = {i: random.uniform(0.0, 1.5)
                                   for i in range(len(LANE_PATHS[direction]["lanes_in"]))}
-        self._spawn_timer_out = {i: random.uniform(0, SPAWN_INTERVAL_BASE)
+        self._spawn_timer_out = {i: random.uniform(0.0, 2.5)
                                   for i in range(len(LANE_PATHS[direction]["lanes_out"]))}
         self.total_passed = 0
         self.total_wait   = 0.0
         self._n_lanes_in  = len(LANE_PATHS[direction]["lanes_in"])
         self._n_lanes_out = len(LANE_PATHS[direction]["lanes_out"])
+        self.spawn_interval_base = SPAWN_INTERVAL_BASE
+        self.spawn_jitter = SPAWN_JITTER
+        self.max_incoming = MAX_VEHICLES_PER_LANE
+        self.max_outgoing = 6
 
     @property
     def vehicles(self):
         return self.incoming + self.outgoing
 
     def _spawn_interval(self, base_extra=0.0):
-        return max(1.2, SPAWN_INTERVAL_BASE + base_extra + random.uniform(-SPAWN_JITTER, SPAWN_JITTER))
+        base = getattr(self, "spawn_interval_base", SPAWN_INTERVAL_BASE)
+        jitter = getattr(self, "spawn_jitter", SPAWN_JITTER)
+        return max(0.8, base + base_extra + random.uniform(-jitter, jitter))
 
     def spawn_special_vehicle(self, vtype: str, dest_dir: str):
         """Manually spawns an emergency vehicle at a random lane."""
@@ -219,16 +227,12 @@ class Lane:
     def update(self, dt: float, sim_speed: float):
         rdt = dt * sim_speed
 
-        # Update light
-        self.light.update(rdt)
-
         # Spawn incoming vehicles per lane track
         for lane_idx in range(self._n_lanes_in):
             self._spawn_timer_in[lane_idx] += rdt
-            interval = self._spawn_interval(lane_idx * 0.3)
-            in_lane = [v for v in self.incoming if v.lane_idx == lane_idx]
+            interval = self._spawn_interval(lane_idx * 0.35)
             if (self._spawn_timer_in[lane_idx] >= interval
-                    and len(self.incoming) < MAX_VEHICLES_PER_LANE):
+                    and len(self.incoming) < self.max_incoming):
                 self._spawn_timer_in[lane_idx] = 0.0
                 v = Vehicle(self.direction, False, lane_idx)
                 self.incoming.append(v)
@@ -236,9 +240,9 @@ class Lane:
         # Spawn outgoing vehicles
         for lane_idx in range(self._n_lanes_out):
             self._spawn_timer_out[lane_idx] += rdt
-            interval = self._spawn_interval(0.6 + lane_idx * 0.3)
+            interval = self._spawn_interval(1.2 + lane_idx * 0.5)
             if (self._spawn_timer_out[lane_idx] >= interval
-                    and len(self.outgoing) < MAX_VEHICLES_PER_LANE):
+                    and len(self.outgoing) < self.max_outgoing):
                 self._spawn_timer_out[lane_idx] = 0.0
                 v = Vehicle(self.direction, True, lane_idx)
                 self.outgoing.append(v)
@@ -267,17 +271,86 @@ class Lane:
 
 
 class Intersection:
-    """Top-level coordinator for all 4 lanes."""
+    """
+    Central Master Intersection Phase Coordinator.
+    Enforces a strict 4-phase sequential cyclic schedule:
+      Stage 0: North Green
+      Stage 1: North Yellow (3s)
+      Stage 2: East Green
+      Stage 3: East Yellow (3s)
+      Stage 4: South Green
+      Stage 5: South Yellow (3s)
+      Stage 6: West Green
+      Stage 7: West Yellow (3s)
+    Mathematically guarantees that exactly ONE approach has Green or Yellow at any moment.
+    All other approaches are strictly and unconditionally RED.
+    """
 
     def __init__(self):
-        offsets = {"NORTH": 0, "EAST": 28, "SOUTH": 14, "WEST": 42}
-        self.lights = {d: TrafficLight(d, offset=offsets[d]) for d in DIRECTIONS}
+        self.green_times = {"NORTH": 25.0, "EAST": 25.0, "SOUTH": 25.0, "WEST": 25.0}
+        self.yellow_time = 3.0
+
+        self.stage_idx = 0      # 0 to 7
+        self.stage_timer = 0.0  # seconds elapsed in active stage
+
+        self.lights = {d: TrafficLight(d) for d in DIRECTIONS}
         self.lanes  = {d: Lane(d, self.lights[d]) for d in DIRECTIONS}
         self.elapsed  = 0.0
         self.sim_speed = 1.0
+        self.current_scenario = "padat"
+
+        self._update_all_lights()
+        self.set_scenario("padat", flush_excess=True)
+
+    def _stage_duration(self, stage: int) -> float:
+        if stage % 2 == 0:
+            d = PHASE_ORDER[stage // 2]
+            return max(5.0, float(self.green_times[d]))
+        else:
+            return self.yellow_time
+
+    def _update_all_lights(self):
+        active_dir = PHASE_ORDER[self.stage_idx // 2]
+        is_green = (self.stage_idx % 2 == 0)
+        curr_dur = self._stage_duration(self.stage_idx)
+        rem_in_stage = max(0.0, curr_dur - self.stage_timer)
+
+        c_tot = sum(self.green_times.values()) + 4.0 * self.yellow_time
+
+        for d in DIRECTIONS:
+            light = self.lights[d]
+            light.green_duration = self.green_times[d]
+            light.yellow_duration = self.yellow_time
+            light.red_duration = max(3.0, c_tot - self.green_times[d] - self.yellow_time)
+
+            if d == active_dir:
+                light.state = "GREEN" if is_green else "YELLOW"
+                light._time_remaining = rem_in_stage
+            else:
+                light.state = "RED"
+                # Compute countdown until this direction's turn to get Green
+                target_stage = 2 * PHASE_ORDER.index(d)
+                t_wait = rem_in_stage
+                s = (self.stage_idx + 1) % 8
+                while s != target_stage:
+                    t_wait += self._stage_duration(s)
+                    s = (s + 1) % 8
+                light._time_remaining = t_wait
 
     def update(self, dt: float):
-        self.elapsed += dt
+        rdt = dt * self.sim_speed
+        self.elapsed += rdt
+
+        # Advance stage timer
+        self.stage_timer += rdt
+        dur = self._stage_duration(self.stage_idx)
+        while self.stage_timer >= dur:
+            self.stage_timer -= dur
+            self.stage_idx = (self.stage_idx + 1) % 8
+            dur = self._stage_duration(self.stage_idx)
+
+        self._update_all_lights()
+
         for lane in self.lanes.values():
             done_in = lane.update(dt, self.sim_speed)
             # Transfer special vehicles to their destination's outgoing lane
@@ -292,18 +365,89 @@ class Intersection:
                     dest_lane.outgoing.append(v)
 
     def set_red_duration(self, direction: str, secs: float):
-        self.lights[direction].red_duration = max(3.0, float(secs))
+        # Durations are governed by green_times and cycle length
+        pass
 
     def set_green_duration(self, direction: str, secs: float):
-        self.lights[direction].green_duration = max(3.0, float(secs))
+        self.green_times[direction] = max(5.0, float(secs))
+        self._update_all_lights()
+
+    def set_scenario(self, scenario_name: str, flush_excess: bool = True):
+        """
+        Dynamically adjusts arrival patterns for all approaches with distinct visual profiles:
+        - 'sepi': Sesi 1 Off-Peak (sparse, quiet road, max 3 vehicles, calm flow)
+        - 'normal': Sesi 2 Normal (regular moderate urban flow, max 7 vehicles)
+        - 'padat': Sesi 3 Peak (dense arterial rush hour, max 16 vehicles, heavy queuing)
+        """
+        self.current_scenario = scenario_name
+        scen_lower = scenario_name.lower()
+
+        if "sepi" in scen_lower or "low" in scen_lower:
+            intervals = {"NORTH": 8.5, "EAST": 18.0, "SOUTH": 9.0, "WEST": 20.0}
+            jitters   = {"NORTH": 1.5, "EAST": 3.0,  "SOUTH": 1.5, "WEST": 3.0}
+            max_in = 3
+            max_out = 2
+        elif "normal" in scen_lower or "medium" in scen_lower:
+            intervals = {"NORTH": 3.5, "EAST": 7.5,  "SOUTH": 3.6, "WEST": 8.0}
+            jitters   = {"NORTH": 0.8, "EAST": 1.5,  "SOUTH": 0.8, "WEST": 1.5}
+            max_in = 7
+            max_out = 4
+        else: # padat / peak
+            intervals = {"NORTH": 1.25, "EAST": 3.2,  "SOUTH": 1.30, "WEST": 3.5}
+            jitters   = {"NORTH": 0.3,  "EAST": 0.6,  "SOUTH": 0.3,  "WEST": 0.6}
+            max_in = 16
+            max_out = 8
+
+        for d, lane in self.lanes.items():
+            lane.spawn_interval_base = intervals.get(d, 3.5)
+            lane.spawn_jitter = jitters.get(d, 0.8)
+            lane.max_incoming = max_in
+            lane.max_outgoing = max_out
+
+            if flush_excess:
+                if "sepi" in scen_lower or "low" in scen_lower:
+                    # Clear excess queues so off-peak looks sparse and quiet immediately
+                    lane.incoming = lane.incoming[:1]
+                    lane.outgoing = lane.outgoing[:1]
+                    for i in lane._spawn_timer_in:
+                        lane._spawn_timer_in[i] = 0.0
+                elif "normal" in scen_lower or "medium" in scen_lower:
+                    if len(lane.incoming) > 4:
+                        lane.incoming = lane.incoming[:4]
+                else: # padat
+                    # Inject initial rush-hour queue if lane is empty so the peak hour is immediately visible
+                    if len(lane.incoming) < 3:
+                        for l_idx in range(lane._n_lanes_in):
+                            for step in range(2):
+                                v = Vehicle(d, is_outgoing=False, lane_idx=l_idx)
+                                v.t = 0.62 - step * 0.10
+                                v.stopped = True
+                                lane.incoming.append(v)
+
+    def apply_4phase_timings(self, green_times: list, sync_phase: bool = False):
+        """
+        Applies sequential 4-phase coordination (North -> East -> South -> West):
+        green_times = [g_N, g_E, g_S, g_W]
+        yellow = 3.0s
+        If sync_phase is True, resets cycle to start with North Green.
+        If sync_phase is False, smoothly updates durations without interrupting current active phase!
+        """
+        g_N, g_E, g_S, g_W = [max(10.0, float(v)) for v in green_times]
+        self.green_times = {"NORTH": g_N, "EAST": g_E, "SOUTH": g_S, "WEST": g_W}
+
+        if sync_phase:
+            self.stage_idx = 0
+            self.stage_timer = 0.0
+
+        self._update_all_lights()
 
     def stats(self, direction: str) -> dict:
         lane  = self.lanes[direction]
         light = self.lights[direction]
         return {
-            "state":         light.state,
+            "state":          light.state,
             "time_remaining": light.time_remaining(),
-            "queue":         lane.queue_length,
-            "total_passed":  lane.total_passed,
-            "vehicles":      len(lane.vehicles),
+            "queue":          lane.queue_length,
+            "total_passed":   lane.total_passed,
+            "vehicles":       len(lane.vehicles),
         }

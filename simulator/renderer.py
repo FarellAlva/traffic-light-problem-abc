@@ -236,7 +236,7 @@ class QuadrantRenderer:
                 self._font_small = ImageFont.load_default()
         return self._font_label, self._font_small
 
-    def render(self, w: int, h: int, vehicles: list) -> Image.Image:
+    def render(self, w: int, h: int, vehicles: list, light=None, queue_len: int = 0) -> Image.Image:
         frame   = self._get_bg(w, h)           # RGBA
         overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         draw    = ImageDraw.Draw(overlay)
@@ -273,9 +273,6 @@ class QuadrantRenderer:
                 continue
 
             # ── Try real sprite first ───────────────────────────────────────
-            # Since we now have front/rear sprites, we pass v.is_outgoing
-            # We still flip if needed (though the user might have provided correctly oriented ones, let's keep flip_h for now, or maybe flip=False since front/rear is correct?)
-            # Usually front/rear sprites don't need horizontal flipping unless they are asymmetric or we want variety. I'll keep flip_h=False for now since the custom sprites might just work.
             used_sprite = blit_vehicle_sprite(
                 frame, px, py, vw, vh,
                 v.vtype, v.sprite_idx,
@@ -296,35 +293,88 @@ class QuadrantRenderer:
                 is_blue_on = not is_red_on
                 
                 strobe_r = max(2, int(vw * 0.08))
-                
-                # Top roof coordinates
                 rx = px - vw * 0.15
                 bx = px + vw * 0.15
                 ry = py - vh * 0.35
                 
                 if is_red_on:
                     draw.ellipse([rx-strobe_r, ry-strobe_r, rx+strobe_r, ry+strobe_r], fill=(255, 50, 50, int(255 * alpha_f)))
-                    # optional glow
                     draw.ellipse([rx-strobe_r*2, ry-strobe_r*2, rx+strobe_r*2, ry+strobe_r*2], fill=(255, 50, 50, int(100 * alpha_f)))
                 
                 if is_blue_on:
                     draw.ellipse([bx-strobe_r, ry-strobe_r, bx+strobe_r, ry+strobe_r], fill=(50, 50, 255, int(255 * alpha_f)))
-                    # optional glow
                     draw.ellipse([bx-strobe_r*2, ry-strobe_r*2, bx+strobe_r*2, ry+strobe_r*2], fill=(50, 50, 255, int(100 * alpha_f)))
+
+        # ── Draw physical on-road traffic light pole at stop line ───────────
+        if light is not None and self.direction in TRAFFIC_LIGHT_POS:
+            pos = TRAFFIC_LIGHT_POS[self.direction]
+            lx, ly = int(pos[0] * w), int(pos[1] * h)
+            _draw_traffic_light(draw, lx, ly, light.state, light.time_remaining())
 
         # Composite PIL fallback overlay onto background
         frame = Image.alpha_composite(frame, overlay)
 
-        # Direction label (top-left corner)
+        # ── HUD Overlays: Direction label + Quadrant status light indicator ───
         tl_draw = ImageDraw.Draw(frame)
-        font_label, _ = self._get_fonts()
-        label = self.direction
+        font_label, font_small = self._get_fonts()
+        
+        # 1. Direction label (top-left corner)
+        dir_names = {"NORTH": "UTARA", "EAST": "TIMUR", "SOUTH": "SELATAN", "WEST": "BARAT"}
+        label = f"{self.direction} ({dir_names.get(self.direction, '')})"
         lw = int(tl_draw.textlength(label, font=font_label))
-        pad = 5
-        lx, ly = 8, 8
-        tl_draw.rectangle([(lx - pad, ly - pad), (lx + lw + pad, ly + 16 + pad)],
-                          fill=(0, 0, 0, 195))
-        tl_draw.text((lx, ly), label, fill=(255, 255, 255), font=font_label)
+        pad = 6
+        lx, ly = 10, 10
+        tl_draw.rounded_rectangle([(lx - pad, ly - pad), (lx + lw + pad, ly + 20 + pad)],
+                                  radius=6, fill=(10, 12, 24, 215), outline=(50, 70, 110), width=1)
+        tl_draw.text((lx, ly + 1), label, fill=(240, 245, 255), font=font_label)
+
+        # 2. Prominent Traffic Status Light Indicator (top-right corner)
+        if light is not None:
+            state = light.state
+            remaining = light.time_remaining()
+            
+            badge_w, badge_h = 165, 38
+            bx = w - badge_w - 10
+            by = 10
+            
+            tl_draw.rounded_rectangle([(bx, by), (bx + badge_w, by + badge_h)],
+                                      radius=8, fill=(8, 10, 20, 230), outline=(55, 75, 115), width=1)
+            
+            # Glowing traffic light dot / lamp (Merah, Kuning, Hijau)
+            lamp_cx = bx + 20
+            lamp_cy = by + badge_h // 2
+            lamp_r = 9
+            
+            lamp_styles = {
+                "RED":    {"bulb": (255, 50, 50),   "glow": (255, 80, 80),   "text": "MERAH"},
+                "YELLOW": {"bulb": (255, 210, 30),  "glow": (255, 225, 70),  "text": "KUNING"},
+                "GREEN":  {"bulb": (40, 240, 100),  "glow": (80, 255, 140),  "text": "HIJAU"},
+            }
+            style = lamp_styles.get(state, {"bulb": (180, 180, 180), "glow": (180, 180, 180), "text": state})
+            
+            # Glow halo
+            tl_draw.ellipse([(lamp_cx - lamp_r - 5, lamp_cy - lamp_r - 5),
+                             (lamp_cx + lamp_r + 5, lamp_cy + lamp_r + 5)],
+                            outline=style["glow"], width=1)
+            tl_draw.ellipse([(lamp_cx - lamp_r - 2, lamp_cy - lamp_r - 2),
+                             (lamp_cx + lamp_r + 2, lamp_cy + lamp_r + 2)],
+                            outline=style["glow"], width=2)
+            # Solid bright bulb
+            tl_draw.ellipse([(lamp_cx - lamp_r, lamp_cy - lamp_r),
+                             (lamp_cx + lamp_r, lamp_cy + lamp_r)],
+                            fill=style["bulb"])
+            # Specular 3D highlight
+            tl_draw.ellipse([(lamp_cx - lamp_r + 2, lamp_cy - lamp_r + 2),
+                             (lamp_cx - lamp_r + 5, lamp_cy - lamp_r + 5)],
+                            fill=(255, 255, 255))
+            
+            # State name & Countdown timer
+            txt_status = f"{style['text']}  {int(remaining)}s"
+            tl_draw.text((bx + 38, by + 4), txt_status, fill=style["bulb"], font=font_label)
+            
+            # Queue subtext
+            txt_q = f"Antrean: {queue_len} veh"
+            tl_draw.text((bx + 38, by + 21), txt_q, fill=(160, 175, 210), font=font_small)
 
         return frame.convert("RGB")
 
@@ -366,7 +416,7 @@ class IntersectionRenderer:
             lane   = lanes[direction]
             light  = lights[direction]
             vehicles = lane.incoming + lane.outgoing
-            frame  = renderer.render(qw, qh, vehicles)
+            frame  = renderer.render(qw, qh, vehicles, light=light, queue_len=lane.queue_length)
             canvas.paste(frame, (col * qw, row * qh))
 
         return canvas

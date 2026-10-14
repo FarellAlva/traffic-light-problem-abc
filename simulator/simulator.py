@@ -16,13 +16,25 @@ import sys
 import os
 import time
 import math
+import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 import pygame
 
-# Ensure imports from same directory
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Ensure imports from same directory and project root
+_SIM_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SIM_DIR)
+if _SIM_DIR not in sys.path:
+    sys.path.insert(0, _SIM_DIR)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+try:
+    from fitness import TrafficFitnessEvaluator
+    from abc_optimizer import ABCOptimizer, ABCConfig
+except ImportError as _e:
+    print(f"[simulator] Note: ABC optimizer modules not loaded: {_e}")
 
 from config import (
     QUADRANT_W, QUADRANT_H, CONTROL_PANEL_W, STREET_IMAGES,
@@ -69,7 +81,7 @@ class DirectionCard(tk.Frame):
     STATE_COLORS = {"RED": COLOR_RED, "GREEN": COLOR_GREEN, "YELLOW": COLOR_YELLOW}
 
     def __init__(self, parent, direction: str, intersection: Intersection, **kw):
-        super().__init__(parent, bg=COLOR_PANEL_CARD, padx=6, pady=6,
+        super().__init__(parent, bg=COLOR_PANEL_CARD, padx=8, pady=6,
                          highlightthickness=1, highlightbackground="#2a2a4a", **kw)
         self.direction = direction
         self.intersection = intersection
@@ -78,49 +90,51 @@ class DirectionCard(tk.Frame):
         title_frame = tk.Frame(self, bg=COLOR_PANEL_CARD)
         title_frame.pack(fill="x")
 
-        tk.Label(title_frame, text=f"▶  {direction}", font=("Segoe UI", 11, "bold"),
-                 fg=COLOR_ACCENT, bg=COLOR_PANEL_CARD).pack(side="left")
+        dir_names = {"NORTH": "UTARA", "EAST": "TIMUR", "SOUTH": "SELATAN", "WEST": "BARAT"}
+        tk.Label(title_frame, text=f"▶  {direction} ({dir_names.get(direction, '')})",
+                 font=("Segoe UI", 10, "bold"), fg=COLOR_ACCENT, bg=COLOR_PANEL_CARD).pack(side="left")
 
-        self.state_badge = tk.Label(title_frame, text="●", font=("Segoe UI", 14),
+        self.state_badge = tk.Label(title_frame, text="●", font=("Segoe UI", 13),
                                     fg=COLOR_RED, bg=COLOR_PANEL_CARD)
-        self.state_badge.pack(side="right", padx=4)
+        self.state_badge.pack(side="right", padx=3)
 
         self.state_lbl = tk.Label(title_frame, text="RED", font=("Consolas", 9, "bold"),
                                   fg=COLOR_RED, bg=COLOR_PANEL_CARD, width=7, anchor="e")
         self.state_lbl.pack(side="right")
 
         # Countdown bar
-        self.bar_frame = tk.Frame(self, bg="#1a1a2e", height=6)
+        self.bar_frame = tk.Frame(self, bg="#121224", height=6)
         self.bar_frame.pack(fill="x", pady=3)
         self.bar_fill = tk.Frame(self.bar_frame, bg=COLOR_RED, height=6)
         self.bar_fill.place(x=0, y=0, relwidth=1.0, height=6)
 
-        # Red / Green duration sliders
-        self.var_red   = tk.DoubleVar(value=intersection.lights[direction].red_duration)
-        self.var_green = tk.DoubleVar(value=intersection.lights[direction].green_duration)
+        # Timings Info Row (Automated Read-Only Display, No Manual Sliders)
+        timings_frame = tk.Frame(self, bg=COLOR_PANEL_CARD)
+        timings_frame.pack(fill="x", pady=2)
 
-        make_spin_row(self, "🔴  Red (sec):",   self.var_red,   5, 180,
-                      self._on_red_change,   fg=COLOR_RED, accent=COLOR_RED)
-        make_spin_row(self, "🟢  Green (sec):", self.var_green, 5, 180,
-                      self._on_green_change, fg=COLOR_GREEN, accent=COLOR_GREEN)
+        self.lbl_green_dur = tk.Label(timings_frame, text="🟢 Hijau: 25.0s",
+                                      font=("Segoe UI", 8, "bold"), fg=COLOR_GREEN, bg=COLOR_PANEL_CARD)
+        self.lbl_green_dur.pack(side="left", padx=2)
+
+        self.lbl_red_dur = tk.Label(timings_frame, text="🔴 Merah: 84.0s",
+                                    font=("Segoe UI", 8), fg=COLOR_RED, bg=COLOR_PANEL_CARD)
+        self.lbl_red_dur.pack(side="right", padx=2)
 
         # Stats row
         stats_frame = tk.Frame(self, bg=COLOR_PANEL_CARD)
-        stats_frame.pack(fill="x", pady=(4, 0))
+        stats_frame.pack(fill="x", pady=(2, 0))
 
-        self.lbl_queue   = tk.Label(stats_frame, text="Queue: 0",
-                                    font=("Segoe UI", 8), fg=COLOR_SUBTEXT, bg=COLOR_PANEL_CARD)
-        self.lbl_queue.pack(side="left", padx=4)
+        self.lbl_queue = tk.Label(stats_frame, text="Antrean: 0 veh",
+                                  font=("Segoe UI", 8), fg=COLOR_SUBTEXT, bg=COLOR_PANEL_CARD)
+        self.lbl_queue.pack(side="left", padx=2)
 
-        self.lbl_passed  = tk.Label(stats_frame, text="Passed: 0",
-                                    font=("Segoe UI", 8), fg=COLOR_SUBTEXT, bg=COLOR_PANEL_CARD)
-        self.lbl_passed.pack(side="right", padx=4)
+        self.lbl_passed = tk.Label(stats_frame, text="Lolos: 0 veh",
+                                   font=("Segoe UI", 8), fg=COLOR_SUBTEXT, bg=COLOR_PANEL_CARD)
+        self.lbl_passed.pack(side="right", padx=2)
 
-    def _on_red_change(self):
-        self.intersection.set_red_duration(self.direction, float(self.var_red.get()))
-
-    def _on_green_change(self):
-        self.intersection.set_green_duration(self.direction, float(self.var_green.get()))
+    def set_durations_display(self, green_sec: float, red_sec: float):
+        self.lbl_green_dur.config(text=f"🟢 Hijau: {green_sec:.1f}s")
+        self.lbl_red_dur.config(text=f"🔴 Merah: {red_sec:.1f}s")
 
     def update_stats(self, stats: dict):
         state = stats["state"]
@@ -134,13 +148,13 @@ class DirectionCard(tk.Frame):
         duration = light.current_duration()
         remaining = stats["time_remaining"]
         frac = max(0.0, min(1.0, remaining / duration)) if duration > 0 else 0
-        # Update bar width after geometry is known
         bw = self.bar_frame.winfo_width()
         if bw > 1:
             self.bar_fill.place(x=0, y=0, width=int(bw * frac), height=6)
 
-        self.lbl_queue.config(text=f"Queue: {stats['queue']}")
-        self.lbl_passed.config(text=f"Passed: {stats['total_passed']}")
+        self.lbl_queue.config(text=f"Antrean: {stats['queue']} veh")
+        self.lbl_passed.config(text=f"Lolos: {stats['total_passed']} veh")
+        self.set_durations_display(light.green_duration, light.red_duration)
 
 
 # ─────────────────────────────────────────────────
@@ -149,7 +163,7 @@ class DirectionCard(tk.Frame):
 class SimulatorApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Urban Intersection Traffic Simulator")
+        self.title("Urban Intersection Traffic Simulator — ABC Autonomous Optimization")
         self.configure(bg=COLOR_BG)
         self.resizable(True, True)
         
@@ -162,6 +176,17 @@ class SimulatorApp(tk.Tk):
         self.paused = False
         self._last_time = time.perf_counter()
         self._photo = None  # keep reference
+
+        # ── Skenario 3 Sesi & Kontrol Auto ABC ──
+        self.var_scenario = tk.StringVar(value="padat")
+        self.intersection.set_scenario("padat")
+
+        self.var_abc_mode = tk.StringVar(value="auto_abc")
+        self.abc_cycle_count = 0
+        self._abc_daemon_active = True
+        self._reoptimize_event = threading.Event()
+        self._reoptimize_event.set()  # Initial trigger
+        self._best_abc_solution = None
 
         # Build renderers
         self.quad_renderers = {}
@@ -198,6 +223,7 @@ class SimulatorApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
         self._build_ui()
+        self._start_abc_daemon()
         self._schedule_frame()
 
     # ── UI Layout ──────────────────────────────
@@ -253,14 +279,16 @@ class SimulatorApp(tk.Tk):
         # Bind mousewheel to canvas and its children
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
-        # Direction cards
-        self.direction_cards: dict[str, DirectionCard] = {}
-        for d in DIRECTIONS:
-            card = DirectionCard(scroll_frame, d, self.intersection)
-            card.pack(fill="x", padx=8, pady=4)
-            self.direction_cards[d] = card
+        # 1. Skenario Arus (Circumstances - 3 Sesi Observasi)
+        self._build_scenario_card(scroll_frame)
 
-        # Global controls
+        # 2. Kontrol Mode Optimasi (Auto ABC vs Statis Konvensional)
+        self._build_abc_panel(scroll_frame)
+
+        # 3. Telemetri Kuadran Jalan (Read-Only Monitoring, No Manual Override)
+        self._build_telemetry_section(scroll_frame)
+
+        # 4. Global controls (Speed & Simulation Actions)
         ctrl_sep = tk.Frame(scroll_frame, bg="#2a2a4a", height=1)
         ctrl_sep.pack(fill="x", padx=8, pady=4)
 
@@ -463,29 +491,243 @@ class SimulatorApp(tk.Tk):
         self.attributes("-fullscreen", False)
 
     def _reset(self):
-        # Preserve current durations
-        red_durs   = {d: self.intersection.lights[d].red_duration   for d in DIRECTIONS}
-        green_durs = {d: self.intersection.lights[d].green_duration for d in DIRECTIONS}
         speed = self.intersection.sim_speed
-
         self.intersection = Intersection()
         self.intersection.sim_speed = speed
+        scen = self.var_scenario.get()
+        self.intersection.set_scenario(scen)
 
-        for d in DIRECTIONS:
-            self.intersection.set_red_duration(d, red_durs[d])
-            self.intersection.set_green_duration(d, green_durs[d])
+        if self.var_abc_mode.get() == "auto_abc" and self._best_abc_solution:
+            x_opt = self._best_abc_solution.get("best_feasible_x") or [25.0, 25.0, 25.0, 25.0]
+            self.intersection.apply_4phase_timings(x_opt, sync_phase=True)
+        else:
+            self.intersection.apply_4phase_timings([25.0, 25.0, 25.0, 25.0], sync_phase=True)
 
         # Update card references
         for d, card in self.direction_cards.items():
             card.intersection = self.intersection
 
-        # Update renderer references (they don't hold intersection ref)
-        # Recreate intersection renderer with same quad renderers
         self.intersection_renderer = IntersectionRenderer(self.quad_renderers)
-
         self._last_time = time.perf_counter()
 
+    # ── Skenario 3 Sesi Observasi & Kontrol Auto ABC ───────────────
+    def _build_scenario_card(self, parent):
+        card = tk.Frame(parent, bg="#101322", padx=10, pady=8, highlightthickness=1, highlightbackground="#253555")
+        card.pack(fill="x", padx=8, pady=(4, 5))
+
+        hdr = tk.Frame(card, bg="#101322")
+        hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(hdr, text="📊 SKENARIO LALU LINTAS", font=("Segoe UI", 9, "bold"),
+                 fg="#00d4ff", bg="#101322").pack(side="left")
+        tk.Label(hdr, text="(3 Sesi Observasi)", font=("Segoe UI", 7),
+                 fg="#7085a5", bg="#101322").pack(side="left", padx=4)
+
+        scenarios = [
+            ("sepi", "☀️ Sesi 1: Sepi (Off-Peak)", "Arus rendah • ~0.08 veh/s/lane"),
+            ("normal", "⛅ Sesi 2: Normal (Mid-Day)", "Arus sedang • ~0.15 veh/s/lane"),
+            ("padat", "🚗 Sesi 3: Padat (Peak Hour)", "Arus puncak • ~0.30 veh/s/lane"),
+        ]
+
+        for val, label_txt, sub_txt in scenarios:
+            row = tk.Frame(card, bg="#101322")
+            row.pack(fill="x", pady=2)
+
+            rb = tk.Radiobutton(
+                row, text=label_txt, value=val,
+                variable=self.var_scenario,
+                command=self._on_scenario_changed,
+                font=("Segoe UI", 8, "bold"),
+                fg="#e0e8ff", bg="#101322",
+                activeforeground="#00d4ff", activebackground="#101322",
+                selectcolor="#1c243a", cursor="hand2"
+            )
+            rb.pack(anchor="w")
+            tk.Label(row, text=f"    {sub_txt}", font=("Segoe UI", 7),
+                     fg="#687895", bg="#101322").pack(anchor="w")
+
+    def _build_abc_panel(self, parent):
+        card = tk.Frame(parent, bg="#101428", padx=10, pady=8, highlightthickness=1, highlightbackground="#304470")
+        card.pack(fill="x", padx=8, pady=(2, 6))
+
+        hdr = tk.Frame(card, bg="#101428")
+        hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(hdr, text="🐝 KONTROL OPTIMASI SINYAL", font=("Segoe UI", 9, "bold"),
+                 fg="#ffcc00", bg="#101428").pack(side="left")
+
+        mode_frame = tk.Frame(card, bg="#101428")
+        mode_frame.pack(fill="x", pady=2)
+
+        rb_abc = tk.Radiobutton(
+            mode_frame, text="🤖 Mode Auto ABC (Adaptive Optimization)",
+            value="auto_abc", variable=self.var_abc_mode,
+            command=self._on_abc_mode_changed,
+            font=("Segoe UI", 8, "bold"), fg="#44ff88", bg="#101428",
+            activeforeground="#66ffaa", activebackground="#101428",
+            selectcolor="#122a1e", cursor="hand2"
+        )
+        rb_abc.pack(anchor="w")
+
+        rb_fixed = tk.Radiobutton(
+            mode_frame, text="⏱️ Mode Statis (Fixed 25s Tanpa ABC)",
+            value="fixed", variable=self.var_abc_mode,
+            command=self._on_abc_mode_changed,
+            font=("Segoe UI", 8), fg="#b0c0d8", bg="#101428",
+            activeforeground="#ffffff", activebackground="#101428",
+            selectcolor="#202538", cursor="hand2"
+        )
+        rb_fixed.pack(anchor="w")
+
+        # Telemetry Box
+        tbox = tk.Frame(card, bg="#0b0e1b", padx=6, pady=4, highlightthickness=1, highlightbackground="#1e2a44")
+        tbox.pack(fill="x", pady=(4, 4))
+
+        self.lbl_abc_status = tk.Label(tbox, text="● Inisialisasi ABC Daemon...",
+                                       font=("Segoe UI", 8, "bold"), fg="#ffd044", bg="#0b0e1b", anchor="w")
+        self.lbl_abc_status.pack(fill="x")
+
+        self.lbl_abc_greens = tk.Label(tbox, text="U: --s | T: --s | S: --s | B: --s",
+                                       font=("Consolas", 8, "bold"), fg="#00e5ff", bg="#0b0e1b", anchor="w")
+        self.lbl_abc_greens.pack(fill="x", pady=1)
+
+        self.lbl_abc_metrics = tk.Label(tbox, text="Cost J: -- | Rata Antrean: -- | Siklus: --",
+                                        font=("Consolas", 7), fg="#8fa0b8", bg="#0b0e1b", anchor="w")
+        self.lbl_abc_metrics.pack(fill="x")
+
+        self.btn_reoptimize = tk.Button(
+            card, text="🔄 Optimasi Ulang Sekarang",
+            font=("Segoe UI", 8, "bold"), fg="#ffffff", bg="#1a3f68",
+            activeforeground="#ffffff", activebackground="#255890",
+            relief="flat", cursor="hand2", command=self._manual_reoptimize
+        )
+        self.btn_reoptimize.pack(fill="x", pady=(2, 0))
+
+    def _build_telemetry_section(self, parent):
+        sep = tk.Frame(parent, bg="#2a2a4a", height=1)
+        sep.pack(fill="x", padx=8, pady=(4, 4))
+
+        hdr = tk.Frame(parent, bg=COLOR_PANEL_BG)
+        hdr.pack(fill="x", padx=8, pady=(2, 2))
+        tk.Label(hdr, text="📡 TELEMETRI KUADRAN JALAN", font=("Segoe UI", 9, "bold"),
+                 fg=COLOR_TEXT, bg=COLOR_PANEL_BG).pack(side="left")
+        tk.Label(hdr, text="(Status Otomatis)", font=("Segoe UI", 7),
+                 fg=COLOR_SUBTEXT, bg=COLOR_PANEL_BG).pack(side="left", padx=4)
+
+        self.direction_cards: dict[str, DirectionCard] = {}
+        for d in DIRECTIONS:
+            card = DirectionCard(parent, d, self.intersection)
+            card.pack(fill="x", padx=8, pady=3)
+            self.direction_cards[d] = card
+
+    # ── Background ABC Daemon Logic ────────────────────────────────
+    def _start_abc_daemon(self):
+        self._abc_daemon_active = True
+        self._reoptimize_event = threading.Event()
+        self._reoptimize_event.set()  # Initial immediate optimization
+        self._abc_thread = threading.Thread(target=self._abc_daemon_worker, daemon=True)
+        self._abc_thread.start()
+
+    def _abc_daemon_worker(self):
+        while self._abc_daemon_active:
+            # Wait until signaled or wake up every 18 seconds for continuous dynamic tracking
+            self._reoptimize_event.wait(timeout=18.0)
+            self._reoptimize_event.clear()
+
+            if not self._abc_daemon_active:
+                break
+
+            if self.var_abc_mode.get() != "auto_abc":
+                continue
+
+            scen_name = self.var_scenario.get()
+
+            def set_optimizing():
+                if self.var_abc_mode.get() == "auto_abc":
+                    self.lbl_abc_status.config(
+                        text=f"🐝 ABC Optimizing (10 bees) untuk {scen_name.upper()}...",
+                        fg="#ffd044"
+                    )
+            self.after(0, set_optimizing)
+
+            try:
+                # Responsive continuous optimization budget (600 evals ~ 1 sec)
+                ev = TrafficFitnessEvaluator(
+                    scenario_name=scen_name,
+                    horizon_sec=240.0,
+                    eval_seed=int(time.time()) % 10000
+                )
+                cfg = ABCConfig(SN=10, limit=60, max_evals=600)
+                opt = ABCOptimizer(ev, cfg)
+                res = opt.optimize()
+
+                def on_done(result=res, scen=scen_name):
+                    if self.var_abc_mode.get() == "auto_abc" and self.var_scenario.get() == scen:
+                        self._apply_autonomous_abc(result, scen)
+                self.after(0, on_done)
+            except Exception as e:
+                print(f"[ABC Daemon] Error during optimization: {e}")
+                def on_err(err=str(e)):
+                    self.lbl_abc_status.config(text=f"⚠️ ABC Error: {err[:30]}", fg="#ff5555")
+                self.after(0, on_err)
+
+    def _apply_autonomous_abc(self, res: dict, target_scen: str):
+        self.abc_cycle_count += 1
+        self._best_abc_solution = res
+        x_opt = res.get("best_feasible_x") or [25.0, 25.0, 25.0, 25.0]
+        det = res.get("best_feasible_details") or {}
+        cost = res.get("best_feasible_cost") or 0.0
+        wait = det.get("avg_wait_sec", 0.0)
+        q = det.get("avg_queue_len", 0.0)
+        cycle = det.get("cycle_time", sum(x_opt) + 12.0)
+
+        # Smooth phase application (reset to phase 0 on scenario change or first cycle)
+        is_scen_change = (getattr(self, "_last_applied_scen", None) != target_scen)
+        sync_phase = (self.abc_cycle_count == 1) or is_scen_change
+        self._last_applied_scen = target_scen
+        self.intersection.apply_4phase_timings(x_opt, sync_phase=sync_phase)
+
+        self.lbl_abc_status.config(
+            text=f"● ABC Aktif (Siklus #{self.abc_cycle_count} • {res['runtime_sec']:.2f}s)",
+            fg="#44ff88"
+        )
+        self.lbl_abc_greens.config(
+            text=f"U: {x_opt[0]:.1f}s | T: {x_opt[1]:.1f}s | S: {x_opt[2]:.1f}s | B: {x_opt[3]:.1f}s"
+        )
+        self.lbl_abc_metrics.config(
+            text=f"J(x): {cost:.2f} | Rata Antrean: {q:.1f} veh | Siklus C: {cycle:.1f}s"
+        )
+
+    def _on_scenario_changed(self):
+        scen = self.var_scenario.get()
+        self.intersection.set_scenario(scen, flush_excess=True)
+        if self.var_abc_mode.get() == "auto_abc":
+            self.lbl_abc_status.config(text=f"🐝 Mendeteksi Sinyal Optimal ({scen.upper()})...", fg="#ffd044")
+            self._reoptimize_event.set()
+        else:
+            self.lbl_abc_status.config(text=f"● Skenario: {scen.upper()} (Statis 25s)", fg="#ffaa44")
+
+    def _on_abc_mode_changed(self):
+        mode = self.var_abc_mode.get()
+        if mode == "auto_abc":
+            self.btn_reoptimize.config(state="normal")
+            self.lbl_abc_status.config(text="● ABC Aktif: Mengoptimalkan...", fg="#ffd044")
+            self._reoptimize_event.set()
+        else:  # fixed
+            self.btn_reoptimize.config(state="disabled")
+            fixed_x = [25.0, 25.0, 25.0, 25.0]
+            self.intersection.apply_4phase_timings(fixed_x, sync_phase=True)
+            self.lbl_abc_status.config(text="● Mode Statis (Fixed 25s Tanpa ABC)", fg="#ffaa44")
+            self.lbl_abc_greens.config(text="U: 25.0s | T: 25.0s | S: 25.0s | B: 25.0s")
+            self.lbl_abc_metrics.config(text="Tanpa Adaptasi ABC | Siklus C: 112.0s")
+
+    def _manual_reoptimize(self):
+        if self.var_abc_mode.get() == "auto_abc":
+            self.lbl_abc_status.config(text="🐝 Mencari durasi optimal baru...", fg="#ffd044")
+            self._reoptimize_event.set()
+
     def _on_closing(self):
+        self._abc_daemon_active = False
+        if hasattr(self, "_reoptimize_event"):
+            self._reoptimize_event.set()
         try:
             if pygame.mixer.get_init():
                 pygame.mixer.stop()

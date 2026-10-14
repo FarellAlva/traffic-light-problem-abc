@@ -74,9 +74,9 @@ COLOR_LABEL_BG   = "black"
 # ─── Hardcoded defaults (used when calibration.json is absent) ─────────────────
 
 _DEFAULT_TRAFFIC_LIGHT_POS = {
-    "NORTH": (0.36, 0.62),
-    "EAST":  (0.16, 0.48),
-    "SOUTH": (0.60, 0.32),
+    "NORTH": (0.83, 0.68),
+    "EAST":  (0.80, 0.64),
+    "SOUTH": (0.80, 0.58),
     "WEST":  (0.82, 0.52),
 }
 
