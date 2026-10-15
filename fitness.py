@@ -30,7 +30,7 @@ PENALTY_CYCLE = 25.0  # penalty weight for cycle time violations
 
 def calculate_cycle_time(x: List[float]) -> float:
     """Cycle time C = sum(g_i) + 4 * yellow_time"""
-    return sum(x) + 4.0 * YELLOW_TIME
+    return sum(x) + 4.0 * YELLOW_TIME   
 
 
 def check_feasibility(x: List[float]) -> Tuple[bool, List[str]]:
